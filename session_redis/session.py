@@ -1,4 +1,5 @@
 # Copyright 2016-2024 Camptocamp SA
+# Copyright 2026 Hibou Corp.
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html)
 
 import builtins
@@ -6,9 +7,12 @@ import json
 import logging
 from typing import TypeAlias
 
-import odoo.http
-from odoo.http import SESSION_LIFETIME
-from odoo.tools._vendor.sessions import SessionStore
+from odoo.http.session import (
+    SESSION_LIFETIME,
+    Session,
+    SessionStore,
+    _session_identifier_re,
+)
 
 from . import json_encoding
 
@@ -33,12 +37,13 @@ class RedisSessionStore(SessionStore):
     def __init__(
         self,
         redis,
-        session_class=None,
+        session_cls=Session,
         prefix="",
         expiration=None,
         anon_expiration=None,
-    ):
-        super().__init__(session_class=session_class)
+        ):
+        self.path = None
+        self.session_cls = session_cls
         self.redis = redis
         if expiration is None:
             self.expiration = SESSION_LIFETIME
@@ -50,15 +55,7 @@ class RedisSessionStore(SessionStore):
             self.anon_expiration = anon_expiration
         self.prefix = "session:"
         if prefix:
-            self.prefix = f"{self.prefix}:{prefix}:"
-
-    # Use the key generation method of the FileSystemSessionStore: it seems that
-    # the one on the general SessionStore does not generate long enough keys to
-    # support the device session rotation logic (SessionStore produces 40
-    # character long keys, while the new rotation logic appears to assume a
-    # length of at least 84).
-    generate_key = odoo.http.FilesystemSessionStore.generate_key
-    is_valid_key = odoo.http.FilesystemSessionStore.is_valid_key
+            self.prefix = f"{self.prefix}{prefix}:"
 
     def build_key(self, sid):
         return f"{self.prefix}{sid}"
@@ -99,7 +96,6 @@ class RedisSessionStore(SessionStore):
         if self.redis.set(key, data):
             if not (expiration and isinstance(expiration, int)):
                 expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
-                expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
             return self.redis.expire(key, expiration)
 
     def delete(self, session):
@@ -107,8 +103,8 @@ class RedisSessionStore(SessionStore):
         _logger.debug(f"deleting session with key {key}")
         return self.redis.delete(key)
 
-    def get(self, sid):
-        if not self.is_valid_key(sid):
+    def get(self, sid, *, keep_sid=False):
+        if not self.is_valid_session_id(sid):
             _logger.debug(
                 f"session with invalid sid '{sid}' has been asked, returning a new one"
             )
@@ -117,6 +113,12 @@ class RedisSessionStore(SessionStore):
         key = self.build_key(sid)
         saved = self.redis.get(key)
         if not saved:
+            if keep_sid:
+                _logger.debug(
+                    f"session with non-existent key '{key}' has been asked, "
+                    "returning an empty one with the same sid"
+                )
+                return self.session_cls({}, sid, new=False)
             _logger.debug(
                 f"session with non-existent key '{key}' has been asked, "
                 "returning a new one"
@@ -130,16 +132,12 @@ class RedisSessionStore(SessionStore):
                 "content could not be read, it has been reset"
             )
             data = {}
-        return self.session_class(data, sid, False)
+        return self.session_cls(data, sid, new=False)
 
     def list(self):
         keys = self.redis.keys(f"{self.prefix}*")
         _logger.debug("a listing redis keys has been called")
         return [key[len(self.prefix) :] for key in keys]
-
-    # The FilesystemSessionStore's rotate does not do anything file-system
-    # specific so it can just be reused here
-    rotate = odoo.http.FilesystemSessionStore.rotate
 
     def vacuum(self, *args, **kwargs):
         """Do not garbage collect the sessions
@@ -176,8 +174,8 @@ class RedisSessionStore(SessionStore):
         identifiers = set(identifiers)
         not_found = set()
         for partial_sid in identifiers:
-            key = f"session::{self.prefix}:{partial_sid}*"
-            match = self.redis.keys(pattern=key)
+            key = f"{self.prefix}{partial_sid}*"
+            match = next(self.redis.scan_iter(match=key), None)
             if not match:
                 not_found.add(partial_sid)
         return not_found
@@ -194,7 +192,7 @@ class RedisSessionStore(SessionStore):
         for identifier in identifiers:
             # Avoid removing a session if it does not match an identifier. See this same
             # comment in odoo.http.FileSessionStore.delete_from_identifiers.
-            if not odoo.http._session_identifier_re.match(identifier):
+            if not _session_identifier_re.match(identifier):
                 raise ValueError(
                     "Identifier format incorrect, did you pass in a string instead ",
                     "of a list?",

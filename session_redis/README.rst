@@ -43,7 +43,15 @@ Limitations
 * The server has to be restarted in order for the sessions to be stored in
   Redis.
 * All the users will have to login again as their previous session will be
-  dropped.
-* The addon monkey-patch ``odoo.http.Root.session_store`` with a custom
-  method when the Redis mode is active, so incompatibilities with other addons
-  is possible if they do the same.
+  dropped. The existing filesystem sessions in ``session_dir`` are purged at
+  startup.
+* When the Redis mode is active, the addon monkey-patches
+  ``odoo.http.session.session_store`` with a function returning a
+  ``RedisSessionStore``. The function is also replaced in every already
+  imported module holding a reference to the original one (e.g.
+  ``odoo.http.router``, ``odoo.http.dispatcher``,
+  ``odoo.addons.base.models.res_device``, ``odoo.addons.base.models.ir_http``).
+  Incompatibilities with other addons are possible if they do the same.
+* The Redis client must provide the ``get``, ``set``, ``expire``, ``delete``,
+  ``keys`` and ``scan_iter`` methods (``scan_iter`` must accept a ``match``
+  keyword argument and return an iterator of keys).

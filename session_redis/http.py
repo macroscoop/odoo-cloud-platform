@@ -1,8 +1,11 @@
 # Copyright 2016-2024 Camptocamp SA
+# Copyright 2026 Hibou Corp.
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html)
 import functools
 import logging
 import os
+import shutil
+import sys
 
 from odoo import http
 from odoo.tools import config
@@ -45,8 +48,8 @@ ssl_cert_reqs = os.getenv("ODOO_SESSION_REDIS_SSL_CERT_REQS", "1")
 redis_cluster = os.getenv("ODOO_SESSION_REDIS_CLUSTER", "0")
 
 
-@functools.cached_property
-def session_store(self):
+@functools.cache
+def session_store():
     if sentinel_host:
         sentinel = Sentinel([(sentinel_host, sentinel_port)], password=password)
         redis_client = sentinel.master_for(sentinel_master_name)
@@ -73,7 +76,7 @@ def session_store(self):
         prefix=prefix,
         expiration=expiration,
         anon_expiration=anon_expiration,
-        session_class=http.Session,
+        session_cls=http.session.Session,
     )
 
 
@@ -83,11 +86,22 @@ def purge_fs_sessions(path):
         return
 
     for fname in os.listdir(path):
-        path = os.path.join(path, fname)
+        fpath = os.path.join(path, fname)
         try:
-            os.unlink(path)
+            if os.path.isdir(fpath):
+                shutil.rmtree(fpath)
+            else:
+                os.unlink(fpath)
         except OSError:
-            _logger.warning("OS Error during purge of redis sessions.")
+            _logger.warning("OS Error during purge of filesystem sessions.")
+
+
+def patch_session_store():
+    original = http.session.session_store
+    for module in list(sys.modules.values()):
+        module_dict = getattr(module, "__dict__", None)
+        if module_dict and module_dict.get("session_store") is original:
+            module.session_store = session_store
 
 
 if is_true(os.getenv("ODOO_SESSION_REDIS")):
@@ -105,15 +119,7 @@ if is_true(os.getenv("ODOO_SESSION_REDIS")):
             host,
             port,
         )
-    http.Application.session_store = session_store
-    # cached_property needs __set_name__ to be called, but it is not called
-    # automatically since we are attaching the property after instance creation.
-    # So we have to do it manually
-    # See: https://docs.python.org/3/reference/datamodel.html#object.__set_name__
-    # Credit: https://stackoverflow.com/a/62161136
-    http.Application.session_store.__set_name__(
-        http.Application,
-        "session_store",
-    )
+
+    patch_session_store()
     # clean the existing sessions on the file system
     purge_fs_sessions(config.session_dir)
