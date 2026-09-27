@@ -5,6 +5,8 @@
 import builtins
 import json
 import logging
+import time
+from collections.abc import Iterable
 from typing import TypeAlias
 
 from odoo.http.session import (
@@ -31,6 +33,17 @@ _logger = logging.getLogger(__name__)
 PartialSid: TypeAlias = str
 
 
+def _to_seconds(value, default):
+    if value in (None, False, ""):
+        return default
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        _logger.warning("Invalid session expiration %r, using %s seconds", value, default)
+        return default
+    return seconds if seconds > 0 else default
+
+
 class RedisSessionStore(SessionStore):
     """SessionStore that saves session to redis"""
 
@@ -45,14 +58,8 @@ class RedisSessionStore(SessionStore):
         self.path = None
         self.session_cls = session_cls
         self.redis = redis
-        if expiration is None:
-            self.expiration = SESSION_LIFETIME
-        else:
-            self.expiration = expiration
-        if anon_expiration is None:
-            self.anon_expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
-        else:
-            self.anon_expiration = anon_expiration
+        self.expiration = _to_seconds(expiration, SESSION_LIFETIME)
+        self.anon_expiration = _to_seconds(anon_expiration, DEFAULT_SESSION_TIMEOUT_ANONYMOUS)
         self.prefix = "session:"
         if prefix:
             self.prefix = f"{self.prefix}{prefix}:"
@@ -60,26 +67,22 @@ class RedisSessionStore(SessionStore):
     def build_key(self, sid):
         return f"{self.prefix}{sid}"
 
+    def _session_ttl(self, session):
+        # A rotated session carries an absolute ``deletion_time`` (epoch); it must
+        # only survive the rotation window (odoo.http.SESSION_DELETION_TIMER).
+        deletion_time = session.get("deletion_time")
+        if deletion_time:
+            try:
+                return max(1, int(float(deletion_time) - time.time()))
+            except (TypeError, ValueError):
+                pass
+        default = self.expiration if session.uid else self.anon_expiration
+        # Allow a custom relative expiration, e.g. very short monitoring sessions.
+        return _to_seconds(session.get("expiration"), default)
+
     def save(self, session):
         key = self.build_key(session.sid)
-
-        # If the session has a deletion_time, it is slated for rotation, and
-        # should be removed once the rotation window is over. See
-        # odoo.http.SESSION_DELETION_TIMER.
-        # Otherwise, allow to set a custom expiration for a session
-        # such as a very short one for monitoring requests
-        if session.uid:
-            expiration = (
-                session.get("deletion_time")
-                or session.get("expiration")
-                or self.expiration
-            )
-        else:
-            expiration = (
-                session.get("deletion_time")
-                or session.get("expiration")
-                or self.anon_expiration
-            )
+        expiration = self._session_ttl(session)
         if _logger.isEnabledFor(logging.DEBUG):
             if session.uid:
                 user_msg = f"user '{session.login}' (id: {session.uid})"
@@ -93,15 +96,22 @@ class RedisSessionStore(SessionStore):
         data = json.dumps(dict(session), cls=json_encoding.SessionEncoder).encode(
             "utf-8"
         )
-        if self.redis.set(key, data):
-            if not (expiration and isinstance(expiration, int)):
-                expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
-            return self.redis.expire(key, expiration)
+        return self.redis.set(key, data, ex=expiration)
 
     def delete(self, session):
         key = self.build_key(session.sid)
         _logger.debug(f"deleting session with key {key}")
         return self.redis.delete(key)
+
+    def _decode(self, key, saved):
+        try:
+            return json.loads(saved.decode("utf-8"), cls=json_encoding.SessionDecoder)
+        except ValueError:
+            _logger.debug(
+                f"session for key '{key}' has been asked but its json "
+                "content could not be read, it has been reset"
+            )
+            return {}
 
     def get(self, sid, *, keep_sid=False):
         if not self.is_valid_session_id(sid):
@@ -124,15 +134,26 @@ class RedisSessionStore(SessionStore):
                 "returning a new one"
             )
             return self.new()
-        try:
-            data = json.loads(saved.decode("utf-8"), cls=json_encoding.SessionDecoder)
-        except ValueError:
-            _logger.debug(
-                f"session for key '{key}' has been asked but its json "
-                "content could not be read, it has been reset"
-            )
-            data = {}
-        return self.session_cls(data, sid, new=False)
+        return self.session_cls(self._decode(key, saved), sid, new=False)
+
+    def get_many(self, sids: Iterable[str]) -> dict:
+        """
+        Fetch several sessions in a single round trip.
+
+        :returns: ``{sid: Session}`` for every valid sid that exists in redis;
+            missing or invalid sids are omitted.
+        """
+        sids = [sid for sid in dict.fromkeys(sids) if sid and self.is_valid_session_id(sid)]
+        if not sids:
+            return {}
+        keys = [self.build_key(sid) for sid in sids]
+        # RedisCluster cannot MGET keys living in different hash slots.
+        mget = getattr(self.redis, "mget_nonatomic", None) or self.redis.mget
+        result = {}
+        for sid, key, saved in zip(sids, keys, mget(keys)):
+            if saved:
+                result[sid] = self.session_cls(self._decode(key, saved), sid, new=False)
+        return result
 
     def list(self):
         keys = self.redis.keys(f"{self.prefix}*")

@@ -10,6 +10,7 @@ import sys
 from odoo import http
 from odoo.tools import config
 
+from .bus_session import patch_bus_check_sessions
 from .session import RedisSessionStore
 from .strtobool import strtobool
 
@@ -121,5 +122,6 @@ if is_true(os.getenv("ODOO_SESSION_REDIS")):
         )
 
     patch_session_store()
+    patch_bus_check_sessions()
     # clean the existing sessions on the file system
     purge_fs_sessions(config.session_dir)
